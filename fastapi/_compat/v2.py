@@ -22,7 +22,7 @@ from pydantic import ValidationError as ValidationError
 from pydantic._internal._schema_generation_shared import (  # type: ignore[attr-defined]
     GetJsonSchemaHandler as GetJsonSchemaHandler,
 )
-from pydantic._internal._typing_extra import eval_type_lenient
+from pydantic._internal._typing_extra import try_eval_type
 from pydantic._internal._utils import lenient_issubclass as lenient_issubclass
 from pydantic.fields import FieldInfo as FieldInfo
 from pydantic.json_schema import GenerateJsonSchema as GenerateJsonSchema
@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover
 RequiredParam = PydanticUndefined
 Undefined = PydanticUndefined
 UndefinedType = PydanticUndefinedType
-evaluate_forwardref = eval_type_lenient
+evaluate_forwardref = try_eval_type
 Validator = Any
 
 # TODO: remove when dropping support for Pydantic < v2.12.3

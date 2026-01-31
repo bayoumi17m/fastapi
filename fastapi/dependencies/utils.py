@@ -1,3 +1,4 @@
+import ast
 import dataclasses
 import inspect
 import sys
@@ -80,6 +81,40 @@ multipart_incorrect_install_error = (
     'And then install "python-multipart" with: \n\n'
     "pip install python-multipart\n"
 )
+
+
+def _is_annotated_string(forward_arg: str, globalns: dict[str, Any]) -> bool:
+    """
+    Check if a string represents an Annotated type, handling aliases.
+
+    Handles:
+    - Annotated[...]
+    - typing.Annotated[...]
+    - Ann[...] where Ann is an alias for Annotated in globalns
+
+    Args:
+        forward_arg: The string to check
+        globalns: The global namespace for resolving aliases
+
+    Returns:
+        True if the string represents an Annotated type
+    """
+    # Check for aliased imports: extract identifier before '[' and see if it
+    # resolves to Annotated in the namespace
+    bracket_idx = forward_arg.find("[")
+    if bracket_idx == -1:
+        return False
+
+    type_name = forward_arg[:bracket_idx].strip()
+    if not type_name:
+        return False
+
+    # Check if this identifier resolves to typing.Annotated
+    try:
+        resolved = _safe_eval(expr=type_name, globalns=globalns)
+        return resolved is Annotated
+    except (NameError, ValueError, TypeError, AttributeError):
+        return False
 
 
 def ensure_multipart_is_installed() -> None:
@@ -227,12 +262,200 @@ def get_typed_signature(call: Callable[..., Any]) -> inspect.Signature:
     return typed_signature
 
 
+def _safe_eval(expr: str, globalns: dict[str, Any]) -> Any:
+    """
+    Safely evaluate a string expression after validating its AST structure.
+
+    Only allows safe node types: Name, Call, Attribute, Constant, List, Tuple,
+    Dict, Load, Expression, keyword (for keyword args), and Subscript (for generics).
+    This prevents arbitrary code execution while still allowing type annotations
+    and metadata like Depends(...) to be evaluated.
+
+    Args:
+        expr: The string expression to evaluate
+        globalns: The global namespace for evaluation
+
+    Returns:
+        The evaluated result
+
+    Raises:
+        NameError, AttributeError, TypeError, ValueError: If evaluation fails
+        ValueError: If the AST contains unsafe node types
+    """
+    # Parse the expression into an AST
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"Invalid syntax in expression: {expr}") from e
+
+    # Define allowed node types for safe evaluation
+    safe_node_types = (
+        ast.Name,
+        ast.Call,
+        ast.Attribute,
+        ast.Constant,
+        ast.List,
+        ast.Tuple,
+        ast.Dict,
+        ast.Load,
+        ast.Expression,
+        ast.keyword,  # For keyword arguments in function calls (e.g., func(a=1))
+        ast.Subscript,  # Required for generic types like List[int]
+    )
+
+    # Validate that all nodes in the AST are safe
+    # Also check for dangerous function calls like __import__, exec, eval, compile
+    dangerous_names = {"__import__", "exec", "eval", "compile", "open", "__builtins__"}
+    dangerous_attrs = {
+        "__globals__",
+        "__builtins__",
+        "__code__",
+        "__closure__",
+        "__class__",
+        "__bases__",
+        "__mro__",
+        "__subclasses__",
+    }
+
+    for node in ast.walk(tree):
+        if not isinstance(node, safe_node_types):
+            raise ValueError(
+                f"Unsafe node type {type(node).__name__} in expression: {expr}"
+            )
+        # Check for dangerous function names
+        if isinstance(node, ast.Name) and node.id in dangerous_names:
+            raise ValueError(f"Unsafe function name {node.id} in expression: {expr}")
+        # Check for dangerous attribute access
+        if isinstance(node, ast.Attribute) and node.attr in dangerous_attrs:
+            raise ValueError(f"Unsafe attribute {node.attr} in expression: {expr}")
+
+    # Compile and evaluate the validated AST
+    code = compile(tree, "<string>", "eval")
+    return eval(code, globalns, globalns)
+
+
+def _parse_annotated_string(forward_arg: str, globalns: dict[str, Any]) -> Any:
+    """
+    Parse an Annotated type string and construct an Annotated type
+    even if the first type argument cannot be resolved.
+
+    This handles the case where `from __future__ import annotations` is used
+    and the annotated type is defined after the function that uses it.
+
+    For 'Annotated[Potato, Depends(get_potato)]':
+    - First arg 'Potato' becomes ForwardRef('Potato') if unresolvable
+    - Remaining args (like Depends) are evaluated in globalns
+
+    Args:
+        forward_arg: The string content of the ForwardRef
+            (e.g., 'Annotated[Potato, Depends(...)]')
+        globalns: The global namespace for evaluation
+
+    Returns:
+        The constructed Annotated type, or None if parsing fails.
+    """
+    if not _is_annotated_string(forward_arg, globalns):
+        return None
+
+    # Remove prefix (e.g., 'Annotated[', 'typing.Annotated[', or alias) and trailing ']'
+    # Find where the bracket starts after the prefix
+    bracket_start = forward_arg.index("[")
+    inner = forward_arg[bracket_start + 1 : -1]
+
+    # Find the first argument (the type) - handle nested brackets
+    # Note: This simple bracket parser doesn't handle brackets inside string
+    # literals (e.g., "hint("). This is acceptable since such patterns are
+    # extremely rare in type annotation metadata.
+    bracket_level = 0
+    first_comma_idx = -1
+    for i, char in enumerate(inner):
+        if char in "([{":
+            bracket_level += 1
+        elif char in ")]}":
+            bracket_level -= 1
+        elif char == "," and bracket_level == 0:
+            first_comma_idx = i
+            break
+
+    if first_comma_idx == -1:
+        # No comma found - not a valid Annotated with metadata
+        return None
+
+    type_part = inner[:first_comma_idx].strip()
+    metadata_part = inner[first_comma_idx + 1 :].strip()
+
+    # Try to resolve the type, or keep as ForwardRef
+    try:
+        first_arg = _safe_eval(type_part, globalns)
+    except (NameError, ValueError, TypeError, AttributeError):
+        first_arg = ForwardRef(type_part)
+
+    # Parse metadata arguments (handle commas inside function calls)
+    metadata_args: list[Any] = []
+    bracket_level = 0
+    current_arg_start = 0
+
+    for i, char in enumerate(metadata_part):
+        if char in "([{":
+            bracket_level += 1
+        elif char in ")]}":
+            bracket_level -= 1
+        elif char == "," and bracket_level == 0:
+            arg_str = metadata_part[current_arg_start:i].strip()
+            if arg_str:
+                try:
+                    metadata_args.append(_safe_eval(arg_str, globalns))
+                except (NameError, AttributeError, TypeError, ValueError) as e:
+                    # Skip args we can't evaluate - type/name not available in namespace
+                    msg = f"Could not evaluate metadata argument '{arg_str}' in Annotated type: {e}"
+                    logger.warning(
+                        msg,
+                        exc_info=True,
+                    )
+            current_arg_start = i + 1
+
+    # Don't forget the last argument
+    last_arg = metadata_part[current_arg_start:].strip()
+    if last_arg:
+        try:
+            metadata_args.append(_safe_eval(last_arg, globalns))
+        except (NameError, AttributeError, TypeError, ValueError) as e:
+            msg = f"Could not evaluate metadata argument '{last_arg}' in Annotated type: {e}"
+            logger.warning(msg, exc_info=True)
+
+    if not metadata_args:
+        # No metadata could be evaluated - can't construct Annotated
+        logger.warning(
+            f"Could not evaluate any metadata in Annotated type: {forward_arg}. "
+            "Check that imports are correct and names are spelled correctly."
+        )
+        return None
+
+    return Annotated.__class_getitem__((first_arg, *metadata_args))  # type: ignore[attr-defined]
+
+
 def get_typed_annotation(annotation: Any, globalns: dict[str, Any]) -> Any:
     if isinstance(annotation, str):
         annotation = ForwardRef(annotation)
-        annotation = evaluate_forwardref(annotation, globalns, globalns)
+
+    if isinstance(annotation, ForwardRef):
+        annotation = evaluate_forwardref(annotation, globalns)[0]
+
+        # Handle case where ForwardRef wraps an Annotated type that couldn't
+        # be resolved. This happens with `from __future__ import annotations`
+        # when the type is defined after the function. We can still extract
+        # the Annotated metadata (like Depends) even if the inner type remains
+        # a ForwardRef.
+        if isinstance(annotation, ForwardRef):
+            forward_arg = getattr(annotation, "__forward_arg__", "")
+            if _is_annotated_string(forward_arg, globalns):
+                result = _parse_annotated_string(forward_arg, globalns)
+                if result is not None:
+                    return result
+
         if annotation is type(None):
             return None
+
     return annotation
 
 
